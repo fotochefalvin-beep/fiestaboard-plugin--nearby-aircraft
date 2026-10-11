@@ -37,6 +37,10 @@ DECLARED_LINE_WIDTH = 22
 OPENSKY_BASE_URL = "https://opensky-network.org/api"
 OPENSKY_OAUTH_URL = f"{OPENSKY_BASE_URL}/v1/oauth/token"
 OPENSKY_STATES_URL = f"{OPENSKY_BASE_URL}/states/all"
+# Free, keyless callsign -> flight route lookup (origin/destination airports).
+ROUTE_LOOKUP_URL = "https://api.adsbdb.com/v0/callsign"
+# Free, keyless icao24 -> aircraft type lookup.
+AIRCRAFT_LOOKUP_URL = "https://api.adsbdb.com/v0/aircraft"
 
 # State vector field indices (OpenSky API returns arrays)
 # See: https://openskynetwork.github.io/opensky-api/rest.html#response
@@ -326,6 +330,63 @@ class NearbyAircraftPlugin(PluginBase):
             logger.debug(f"Error parsing state vector: {e}")
             return None
     
+    def _lookup_route(self, call_sign: str) -> Dict[str, str]:
+        """Best-effort origin/destination airport (IATA, falling back to ICAO) for a call sign.
+
+        Results (including misses) are memoised per call sign so repeated
+        refreshes don't hit the route API again. Never raises.
+        """
+        empty = {"origin": "", "destination": "", "flight_number": ""}
+        key = (call_sign or "").strip().upper()
+        if not key:
+            return empty
+        cache = self.__dict__.setdefault("_route_cache", {})
+        if key in cache:
+            return cache[key]
+        try:
+            resp = requests.get(f"{ROUTE_LOOKUP_URL}/{key}", timeout=5)
+            if resp.status_code == 404:
+                cache[key] = empty
+                return empty
+            if resp.status_code != 200:
+                return empty
+            route = (resp.json().get("response") or {}).get("flightroute") or {}
+            result = {}
+            for field, name in (("origin", "origin"), ("destination", "destination")):
+                airport = route.get(field) or {}
+                result[name] = str(airport.get("iata_code") or airport.get("icao_code") or "")
+            result["flight_number"] = str(route.get("callsign_iata") or route.get("callsign_icao") or "")
+            cache[key] = result
+            return result
+        except Exception as e:
+            logger.debug(f"Route lookup failed for {key}: {e}")
+            return empty
+
+    def _lookup_aircraft_type(self, icao24: str) -> str:
+        """Best-effort ICAO aircraft type designator (e.g. B738) for an icao24 address.
+
+        Memoised per address (including misses). Never raises.
+        """
+        key = (icao24 or "").strip().upper()
+        if not key:
+            return ""
+        cache = self.__dict__.setdefault("_type_cache", {})
+        if key in cache:
+            return cache[key]
+        try:
+            resp = requests.get(f"{AIRCRAFT_LOOKUP_URL}/{key}", timeout=5)
+            if resp.status_code == 404:
+                cache[key] = ""
+                return ""
+            if resp.status_code != 200:
+                return ""
+            info = (resp.json().get("response") or {}).get("aircraft") or {}
+            cache[key] = str(info.get("icao_type") or "")
+            return cache[key]
+        except Exception as e:
+            logger.debug(f"Aircraft type lookup failed for {key}: {e}")
+            return ""
+
     def _render_width(self) -> int:
         """Column budget for the single-line 'formatted'/'headers' variables.
 
@@ -502,6 +563,10 @@ class NearbyAircraftPlugin(PluginBase):
             "altitude": 0,
             "ground_speed": 0,
             "squawk": "----",
+            "origin": "",
+            "destination": "",
+            "flight_number": "",
+            "aircraft_type": "",
             "formatted": message[:width],
             "headers": headers,
             "last_updated": datetime.now(timezone.utc).isoformat(),
@@ -532,6 +597,10 @@ class NearbyAircraftPlugin(PluginBase):
             "altitude": primary["altitude"],
             "ground_speed": primary["ground_speed"],
             "squawk": primary["squawk"],
+            "origin": primary.get("origin", ""),
+            "destination": primary.get("destination", ""),
+            "flight_number": primary.get("flight_number", ""),
+            "aircraft_type": primary.get("aircraft_type", ""),
             "formatted": primary["formatted"],
             "headers": headers,
             "aircraft_count": len(aircraft),
@@ -700,6 +769,10 @@ class NearbyAircraftPlugin(PluginBase):
 
             if not nearby_aircraft:
                 return self._empty_success_result()
+
+            for aircraft in nearby_aircraft:
+                aircraft.update(self._lookup_route(aircraft["call_sign"]))
+                aircraft["aircraft_type"] = self._lookup_aircraft_type(aircraft["icao24"])
 
             last_updated = datetime.now(timezone.utc).isoformat()
             # Cache raw aircraft only -- no "formatted"/"headers" baked in,

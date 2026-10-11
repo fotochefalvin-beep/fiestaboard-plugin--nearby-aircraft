@@ -181,6 +181,34 @@
         "max_length": 25,
         "group": "display",
         "example": "2025-03-15 10:00:00"
+      },
+      "origin": {
+        "description": "Origin airport of closest aircraft (IATA/ICAO code)",
+        "type": "string",
+        "max_length": 4,
+        "group": "closest",
+        "example": "JFK"
+      },
+      "destination": {
+        "description": "Destination airport of closest aircraft (IATA/ICAO code)",
+        "type": "string",
+        "max_length": 4,
+        "group": "closest",
+        "example": "LAX"
+      },
+      "flight_number": {
+        "description": "Flight number (IATA) of closest aircraft",
+        "type": "string",
+        "max_length": 7,
+        "group": "closest",
+        "example": "UA1234"
+      },
+      "aircraft_type": {
+        "description": "Aircraft type code (ICAO) of closest aircraft",
+        "type": "string",
+        "max_length": 4,
+        "group": "closest",
+        "example": "B738"
       }
     },
     "arrays": {
@@ -192,6 +220,10 @@
           "altitude",
           "ground_speed",
           "squawk",
+          "origin",
+          "destination",
+          "flight_number",
+          "aircraft_type",
           "latitude",
           "longitude",
           "distance_km",
@@ -207,7 +239,11 @@
     "aircraft.*.ground_speed": 4,
     "aircraft.*.squawk": 4,
     "aircraft.*.formatted": 22,
-    "aircraft.*.distance_km": 6
+    "aircraft.*.distance_km": 6,
+    "aircraft.*.origin": 4,
+    "aircraft.*.destination": 4,
+    "aircraft.*.flight_number": 7,
+    "aircraft.*.aircraft_type": 4
   },
   "fiestaboard_version": ">=2.10.0",
   "screenshots": [
