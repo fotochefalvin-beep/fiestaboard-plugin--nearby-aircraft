@@ -42,6 +42,48 @@ ROUTE_LOOKUP_URL = "https://api.adsbdb.com/v0/callsign"
 # Free, keyless icao24 -> aircraft type lookup.
 AIRCRAFT_LOOKUP_URL = "https://api.adsbdb.com/v0/aircraft"
 
+# Readable names for common ICAO aircraft type designators (at most 11
+# characters, the manifest's max_length for aircraft_type). Designators not
+# listed here are shown as-is.
+AIRCRAFT_TYPE_NAMES = {
+    # Airbus
+    "A306": "A300-600", "A310": "A310",
+    "BCS1": "A220-100", "BCS3": "A220-300",
+    "A318": "A318", "A319": "A319", "A320": "A320", "A321": "A321",
+    "A19N": "A319neo", "A20N": "A320neo", "A21N": "A321neo",
+    "A332": "A330-200", "A333": "A330-300", "A338": "A330-800neo", "A339": "A330-900neo",
+    "A343": "A340-300", "A346": "A340-600",
+    "A359": "A350-900", "A35K": "A350-1000", "A388": "A380",
+    # Boeing
+    "B712": "717",
+    "B733": "737-300", "B734": "737-400", "B735": "737-500",
+    "B736": "737-600", "B737": "737-700", "B738": "737-800", "B739": "737-900",
+    "B37M": "737 MAX 7", "B38M": "737 MAX 8", "B39M": "737 MAX 9", "B3XM": "737 MAX 10",
+    "B752": "757-200", "B753": "757-300",
+    "B762": "767-200", "B763": "767-300", "B764": "767-400",
+    "B744": "747-400", "B748": "747-8",
+    "B772": "777-200", "B77L": "777-200LR", "B773": "777-300", "B77W": "777-300ER",
+    "B778": "777-8", "B779": "777-9",
+    "B788": "787-8", "B789": "787-9", "B78X": "787-10",
+    "MD11": "MD-11",
+    # Regional
+    "E170": "E170", "E75L": "E175", "E75S": "E175", "E175": "E175",
+    "E190": "E190", "E195": "E195", "E290": "E190-E2", "E295": "E195-E2",
+    "CRJ2": "CRJ200", "CRJ7": "CRJ700", "CRJ9": "CRJ900", "CRJX": "CRJ1000",
+    "DH8D": "Dash 8-400",
+    "AT43": "ATR 42-300", "AT45": "ATR 42-500", "AT46": "ATR 42-600",
+    "AT72": "ATR 72", "AT75": "ATR 72-500", "AT76": "ATR 72-600",
+    "SF34": "Saab 340", "RJ85": "Avro RJ85", "RJ1H": "Avro RJ100",
+    # Business
+    "GLEX": "Global Exp", "GL5T": "Global 5000", "GL6T": "Global 6000", "GL7T": "Global 7500",
+    "GLF4": "Gulfstrm IV", "GLF5": "Gulfstrm V", "GLF6": "G650",
+    "CL35": "CL350", "CL60": "CL600",
+    "C510": "Mustang", "C56X": "Citation XL", "C68A": "Latitude",
+    "E50P": "Phenom 100", "E55P": "Phenom 300",
+    "F2TH": "Falcon 2000", "F900": "Falcon 900", "FA7X": "Falcon 7X", "FA8X": "Falcon 8X",
+    "LJ45": "Learjet 45", "PC12": "PC-12",
+}
+
 # State vector field indices (OpenSky API returns arrays)
 # See: https://openskynetwork.github.io/opensky-api/rest.html#response
 STATE_VECTOR_INDICES = {
@@ -355,17 +397,36 @@ class NearbyAircraftPlugin(PluginBase):
             for field, name in (("origin", "origin"), ("destination", "destination")):
                 airport = route.get(field) or {}
                 result[name] = str(airport.get("iata_code") or airport.get("icao_code") or "")
-            result["flight_number"] = str(route.get("callsign_iata") or route.get("callsign_icao") or "")
+            result["flight_number"] = self._flight_number(key, route.get("airline") or {})
             cache[key] = result
             return result
         except Exception as e:
             logger.debug(f"Route lookup failed for {key}: {e}")
             return empty
 
-    def _lookup_aircraft_type(self, icao24: str) -> str:
-        """Best-effort ICAO aircraft type designator (e.g. B738) for an icao24 address.
+    @staticmethod
+    def _flight_number(call_sign: str, airline: Dict[str, Any]) -> str:
+        """IATA flight number (e.g. BA123) derived from an ICAO call sign (BAW123).
 
-        Memoised per address (including misses). Never raises.
+        Only numeric call signs map to a flight number. Alphanumeric ATC call
+        signs (e.g. BEL5EN) are unrelated to the published flight number, and
+        swapping in the IATA prefix would give a fake one (SN5EN), so those
+        return "".
+        """
+        icao = str(airline.get("icao") or "").upper()
+        iata = str(airline.get("iata") or "").upper()
+        if not icao or not iata or not call_sign.startswith(icao):
+            return ""
+        suffix = call_sign[len(icao):]
+        if not suffix.isdigit():
+            return ""
+        return f"{iata}{int(suffix)}"
+
+    def _lookup_aircraft_type(self, icao24: str) -> str:
+        """Best-effort readable aircraft type (e.g. 737-800) for an icao24 address.
+
+        Common ICAO type designators are mapped via AIRCRAFT_TYPE_NAMES;
+        others are returned as the raw designator. Memoised per address (including misses). Never raises.
         """
         key = (icao24 or "").strip().upper()
         if not key:
@@ -381,7 +442,8 @@ class NearbyAircraftPlugin(PluginBase):
             if resp.status_code != 200:
                 return ""
             info = (resp.json().get("response") or {}).get("aircraft") or {}
-            cache[key] = str(info.get("icao_type") or "")
+            icao_type = str(info.get("icao_type") or "").upper()
+            cache[key] = AIRCRAFT_TYPE_NAMES.get(icao_type, icao_type)
             return cache[key]
         except Exception as e:
             logger.debug(f"Aircraft type lookup failed for {key}: {e}")

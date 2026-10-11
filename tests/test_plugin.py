@@ -1012,6 +1012,49 @@ class TestBoardGeometry:
         assert len(wide_result.data["formatted"]) <= 22
 
 
+class TestFlightNumber:
+    """Test IATA flight number derivation from call signs."""
+
+    AIRLINE = {"icao": "BAW", "iata": "BA"}
+
+    def test_numeric_call_sign(self):
+        assert NearbyAircraftPlugin._flight_number("BAW123", self.AIRLINE) == "BA123"
+
+    def test_leading_zeros_dropped(self):
+        assert NearbyAircraftPlugin._flight_number("BAW0123", self.AIRLINE) == "BA123"
+
+    def test_alphanumeric_call_sign_is_empty(self):
+        airline = {"icao": "BEL", "iata": "SN"}
+        assert NearbyAircraftPlugin._flight_number("BEL5EN", airline) == ""
+
+    def test_airline_without_iata_is_empty(self):
+        assert NearbyAircraftPlugin._flight_number("BAW123", {"icao": "BAW"}) == ""
+
+    def test_call_sign_from_other_airline_is_empty(self):
+        assert NearbyAircraftPlugin._flight_number("EZY123", self.AIRLINE) == ""
+
+
+class TestAircraftType:
+    """Test readable aircraft type names."""
+
+    def _lookup(self, plugin, icao_type):
+        response = Mock(status_code=200)
+        response.json.return_value = {"response": {"aircraft": {"icao_type": icao_type}}}
+        with patch("plugins.nearby_aircraft.requests.get", return_value=response):
+            return plugin._lookup_aircraft_type("abc123")
+
+    def test_known_designator_is_readable(self, plugin):
+        assert self._lookup(plugin, "B78X") == "787-10"
+
+    def test_unknown_designator_is_raw_code(self, plugin):
+        assert self._lookup(plugin, "ZZZZ") == "ZZZZ"
+
+    def test_names_fit_manifest_max_length(self, sample_manifest):
+        from plugins.nearby_aircraft import AIRCRAFT_TYPE_NAMES
+        max_length = sample_manifest["max_lengths"]["aircraft.*.aircraft_type"]
+        assert all(len(name) <= max_length for name in AIRCRAFT_TYPE_NAMES.values())
+
+
 class TestManifestMetadata:
     """Test manifest contains rich variable metadata."""
 
