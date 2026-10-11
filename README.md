@@ -264,6 +264,9 @@ The `headers` variable uses the same column widths as the aircraft data, ensurin
 - `client_secret`: OAuth2 client secret
 - `max_aircraft`: Maximum to display (default: 4, max: 24; the board actually rendered on may show fewer)
 - `refresh_seconds`: Update interval (default: 120, min: 10)
+- `trigger_call_signs`, `trigger_aircraft_types`, `trigger_max_altitude_ft`, `trigger_max_distance_km`: watch rules (all empty by default, see [Trigger a page](#trigger-a-page))
+- `trigger_duration_seconds`: How long a trigger stays on the board (default: 60, min: 10)
+- `trigger_cooldown_minutes`: Minimum time before the same aircraft fires again (default: 30, min: 0)
 
 ### Validation
 
@@ -272,6 +275,8 @@ The `headers` variable uses the same column widths as the aircraft data, ensurin
 - Radius: >= 1 km
 - Max aircraft: 1 to 24
 - Refresh: >= 10 seconds
+- Trigger max altitude / max distance: empty, or 0 or more
+- Trigger duration: >= 10 seconds; trigger cooldown: >= 0 minutes
 
 ## Template Variables
 
@@ -333,6 +338,78 @@ Closest: {{nearby_aircraft.call_sign}}
 Altitude: {{nearby_aircraft.altitude}}ft
 Speed: {{nearby_aircraft.ground_speed}}kt
 ```
+
+## Trigger a page
+
+The plugin can switch the board to a page of your choice when an interesting
+aircraft passes. This is opt-in: with every rule empty, it never fires a trigger.
+
+### Rules
+
+| Setting | Matches when |
+|---|---|
+| `trigger_call_signs` | the call sign starts with one of the comma-separated prefixes, e.g. `KLM, BAW` |
+| `trigger_aircraft_types` | the readable type starts with one of the values (`747` matches `747-8`), or equals an ICAO designator (`A388`); case-insensitive |
+| `trigger_max_altitude_ft` | the aircraft is at or below this altitude (feet) |
+| `trigger_max_distance_km` | the aircraft is within this distance (km) of your location |
+
+- Rules combine with **AND**: every rule you fill in must hold. Several values
+  within one rule match **any** of them. A single rule on its own is fine.
+  Example: call signs `KLM` + max altitude `5000` fires for KLM flights below 5000 ft.
+- Rules look at every airborne aircraft within `radius_km`, not only the
+  `max_aircraft` closest ones shown on the board.
+- The aircraft type is looked up (adsbdb) only for aircraft that pass every
+  other rule; an aircraft whose type is unknown never matches a type rule.
+- At most 10 new adsbdb lookups (type and route together) are started per
+  fetch for triggers. Past that, a trigger still fires but shows only values
+  already known (e.g. an empty `origin`/`aircraft_type`); aircraft whose type
+  could not be checked yet are checked on a later fetch.
+
+### What happens when an aircraft matches
+
+- One trigger per aircraft (`trigger_id` `aircraft_<icao24>`, priority NOTABLE)
+  is shown for `trigger_duration_seconds`.
+- The same aircraft does not fire again until `trigger_cooldown_minutes` have
+  passed, even if it stays in range.
+- As soon as a fresh fetch finds the aircraft no longer matching (for example
+  it moved beyond `trigger_max_distance_km`, climbed above
+  `trigger_max_altitude_ft`, left the radius or landed), its trigger is
+  dismissed early, so the page shows only while the aircraft matches.
+  Changing the plugin settings also clears its active triggers.
+- Cooldowns live in memory only; a restart may announce an aircraft once more.
+
+### Choosing the trigger page
+
+Pick any page with the **Trigger Page** setting (added automatically by
+FiestaBoard). The page receives the plugin's normal variables as
+`{{nearby_aircraft.<key>}}`: `formatted`, `headers`, `aircraft_count`,
+`last_updated` and the `aircraft` array stay as on the normal display, while
+these hold the **triggering** aircraft instead of the closest one:
+
+`call_sign`, `flight_number`, `aircraft_type`, `origin`, `destination`,
+`altitude`, `ground_speed`, `squawk`, plus `distance_km`.
+
+So a page you already built for this plugin works unchanged as the trigger page.
+For example:
+
+```
+{{nearby_aircraft.call_sign}} {{nearby_aircraft.aircraft_type}}
+{{nearby_aircraft.origin}}>{{nearby_aircraft.destination}}
+{{nearby_aircraft.altitude}}FT {{nearby_aircraft.distance_km}}KM
+```
+
+Without a trigger page, the board shows a plain message: call sign and type,
+then `origin>destination` (when known), then altitude and distance.
+
+### Refresh interval caveat
+
+Triggers reuse the regular OpenSky fetch; no extra API calls are made. A new
+aircraft is therefore only noticed on the next fresh fetch, up to
+`refresh_seconds` later, and a quick pass between two fetches can be missed.
+Lower `refresh_seconds` for faster reaction (mind the OpenSky rate limits).
+Clearing the page early also waits for the next fresh fetch. When OpenSky
+fails or rate-limits and cached data is served, nothing new fires and nothing
+is dismissed.
 
 ## Testing
 

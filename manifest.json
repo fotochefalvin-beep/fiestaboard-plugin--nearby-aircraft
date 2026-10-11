@@ -1,7 +1,7 @@
 {
   "id": "nearby_aircraft",
   "name": "Nearby Aircraft",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "Display real-time nearby aircraft information from OpenSky Network API",
   "author": "FiestaBoard Team",
   "repository": "https://github.com/Fiestaboard/fiestaboard-plugin--nearby-aircraft",
@@ -9,6 +9,7 @@
   "icon": "plane",
   "category": "data",
   "min_refresh_seconds": 10,
+  "supports_triggers": true,
   "settings_schema": {
     "type": "object",
     "properties": {
@@ -63,6 +64,44 @@
         "description": "How often to fetch new data (minimum 10 seconds)",
         "default": 120,
         "minimum": 10
+      },
+      "trigger_call_signs": {
+        "type": "string",
+        "title": "Trigger: Call Signs (Optional)",
+        "description": "Fire a trigger when an aircraft whose call sign starts with one of these passes, comma-separated (e.g. \"KLM, BAW\"). Leave every trigger rule empty to never fire a trigger.",
+        "default": ""
+      },
+      "trigger_aircraft_types": {
+        "type": "string",
+        "title": "Trigger: Aircraft Types (Optional)",
+        "description": "Comma-separated aircraft types, e.g. \"A380, 747\" (\"747\" matches \"747-8\") or ICAO designators like \"A388\". Case-insensitive.",
+        "default": ""
+      },
+      "trigger_max_altitude_ft": {
+        "type": "integer",
+        "title": "Trigger: Max Altitude (ft, Optional)",
+        "description": "Only aircraft at or below this altitude in feet.",
+        "minimum": 0
+      },
+      "trigger_max_distance_km": {
+        "type": "number",
+        "title": "Trigger: Max Distance (km, Optional)",
+        "description": "Only aircraft within this distance in kilometers.",
+        "minimum": 0
+      },
+      "trigger_duration_seconds": {
+        "type": "integer",
+        "title": "Trigger Duration (seconds)",
+        "description": "How long the trigger page stays on the board.",
+        "default": 60,
+        "minimum": 10
+      },
+      "trigger_cooldown_minutes": {
+        "type": "integer",
+        "title": "Trigger Cooldown (minutes)",
+        "description": "Minimum time before the same aircraft can fire a trigger again.",
+        "default": 30,
+        "minimum": 0
       }
     },
     "required": [

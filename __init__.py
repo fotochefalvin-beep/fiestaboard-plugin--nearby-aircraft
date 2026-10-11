@@ -5,14 +5,21 @@ Shows call sign, altitude, ground speed, and squawk code for aircraft within
 a user-defined radius.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime, timedelta, timezone
+import copy
 import logging
 import requests
 from math import radians, cos, sin, asin, sqrt
 
 from src.devices import NOTE_COLS
-from src.plugins.base import PluginBase, PluginResult
+from src.plugins.base import PluginBase, PluginResult, TriggerResult
+
+try:
+    from src.triggers.priority import TriggerPriority
+    TRIGGER_PRIORITY = int(TriggerPriority.NOTABLE)
+except ImportError:  # pragma: no cover - hosts older than the priority tiers
+    TRIGGER_PRIORITY = 50
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +91,22 @@ AIRCRAFT_TYPE_NAMES = {
     "LJ45": "Learjet 45", "PC12": "PC-12",
 }
 
+# Trigger defaults (see manifest settings trigger_*).
+DEFAULT_TRIGGER_DURATION_SECONDS = 60
+MIN_TRIGGER_DURATION_SECONDS = 10
+DEFAULT_TRIGGER_COOLDOWN_MINUTES = 30
+# Most uncached adsbdb lookups (route + type, 5 s timeout each) the trigger
+# path may start per fetch, shared by the type rule and trigger enrichment.
+# Lookups are memoised, so a skipped aircraft is checked on a later fetch.
+MAX_TRIGGER_TYPE_LOOKUPS_PER_FETCH = 10
+TRIGGER_ID_PREFIX = "aircraft_"
+
+
+def _utcnow() -> datetime:
+    """Clock for trigger cooldowns (a seam for tests)."""
+    return datetime.now(timezone.utc)
+
+
 # State vector field indices (OpenSky API returns arrays)
 # See: https://openskynetwork.github.io/opensky-api/rest.html#response
 STATE_VECTOR_INDICES = {
@@ -121,6 +144,27 @@ class NearbyAircraftPlugin(PluginBase):
         self._cache: Optional[Dict[str, Any]] = None
         self._access_token: Optional[str] = None
         self._token_expires_at: Optional[datetime] = None
+        self._reset_trigger_state()
+
+    def _reset_trigger_state(self) -> None:
+        """Forget every trigger match, cooldown and pending trigger (memory only).
+
+        Triggers already handed to the host are queued for dismissal (and
+        queued dismissals are kept) so the next check_triggers() clears them
+        instead of orphaning them.
+        """
+        dismissals = list(getattr(self, "_trigger_dismissals", []))
+        dismissals += [f"{TRIGGER_ID_PREFIX}{icao}" for icao in sorted(getattr(self, "_trigger_active", ()))]
+        # icao24 -> when its trigger was last fired (cooldown bookkeeping).
+        self._trigger_fired_at: Dict[str, datetime] = {}
+        # icao24s whose trigger was handed to the host and may still be active.
+        self._trigger_active: Set[str] = set()
+        # Triggers found by the latest fresh fetch, not yet returned.
+        self._trigger_pending: Dict[str, TriggerResult] = {}
+        # trigger_ids to dismiss early (aircraft no longer matches or left).
+        self._trigger_dismissals: List[str] = dismissals
+        # Uncached adsbdb lookups (route + type) left for this fetch.
+        self._trigger_lookup_budget = MAX_TRIGGER_TYPE_LOOKUPS_PER_FETCH
     
     @property
     def plugin_id(self) -> str:
@@ -154,7 +198,33 @@ class NearbyAircraftPlugin(PluginBase):
         refresh_seconds = config.get("refresh_seconds", 120)
         if not isinstance(refresh_seconds, int) or refresh_seconds < 10:
             errors.append("Refresh interval must be at least 10 seconds")
-        
+
+        for key, label in (("trigger_call_signs", "Trigger call signs"),
+                           ("trigger_aircraft_types", "Trigger aircraft types")):
+            value = config.get(key)
+            if value is not None and not isinstance(value, str):
+                errors.append(f"{label} must be a comma-separated list")
+
+        max_alt = config.get("trigger_max_altitude_ft")
+        if not self._is_unset(max_alt) and (
+            isinstance(max_alt, bool) or not isinstance(max_alt, int) or max_alt < 0
+        ):
+            errors.append("Trigger max altitude must be a whole number of feet, 0 or more")
+
+        max_dist = config.get("trigger_max_distance_km")
+        if not self._is_unset(max_dist) and (
+            isinstance(max_dist, bool) or not isinstance(max_dist, (int, float)) or max_dist < 0
+        ):
+            errors.append("Trigger max distance must be a number of km, 0 or more")
+
+        duration = config.get("trigger_duration_seconds", DEFAULT_TRIGGER_DURATION_SECONDS)
+        if isinstance(duration, bool) or not isinstance(duration, int) or duration < MIN_TRIGGER_DURATION_SECONDS:
+            errors.append(f"Trigger duration must be at least {MIN_TRIGGER_DURATION_SECONDS} seconds")
+
+        cooldown = config.get("trigger_cooldown_minutes", DEFAULT_TRIGGER_COOLDOWN_MINUTES)
+        if isinstance(cooldown, bool) or not isinstance(cooldown, int) or cooldown < 0:
+            errors.append("Trigger cooldown must be 0 minutes or more")
+
         return errors
     
     def on_config_change(self, old_config: Dict[str, Any], new_config: Dict[str, Any]) -> None:
@@ -168,6 +238,7 @@ class NearbyAircraftPlugin(PluginBase):
         self._cache = None
         self._access_token = None
         self._token_expires_at = None
+        self._reset_trigger_state()
         logger.debug("Cleared cached aircraft after config change")
     
     @staticmethod
@@ -805,7 +876,9 @@ class NearbyAircraftPlugin(PluginBase):
 
             if not states:
                 # No aircraft found, return empty result
-                return self._empty_success_result()
+                result = self._empty_success_result()
+                self._update_trigger_state([], [], result.data)
+                return result
 
             # Parse state vectors and filter by distance
             nearby_aircraft = []
@@ -827,10 +900,16 @@ class NearbyAircraftPlugin(PluginBase):
             # board's row count -- how many of these are actually shown is
             # decided per render in get_formatted_display, from board.rows.
             nearby_aircraft.sort(key=lambda a: a.get("distance_km", float('inf')))
+            # Trigger rules see every aircraft in the radius, so match before
+            # truncating to max_aircraft.
+            in_radius = list(nearby_aircraft)
+            trigger_matches = self._match_trigger_rules(in_radius)
             nearby_aircraft = nearby_aircraft[:max_aircraft]
 
             if not nearby_aircraft:
-                return self._empty_success_result()
+                result = self._empty_success_result()
+                self._update_trigger_state(in_radius, trigger_matches, result.data)
+                return result
 
             for aircraft in nearby_aircraft:
                 aircraft.update(self._lookup_route(aircraft["call_sign"]))
@@ -841,7 +920,9 @@ class NearbyAircraftPlugin(PluginBase):
             # so this same cached fetch renders correctly for whichever
             # board is bound on a later call (see _build_result_data).
             self._cache = {"aircraft": nearby_aircraft, "last_updated": last_updated}
-            return self._success_result(nearby_aircraft, last_updated)
+            result = self._success_result(nearby_aircraft, last_updated)
+            self._update_trigger_state(in_radius, trigger_matches, result.data)
+            return result
 
         except requests.exceptions.RequestException as e:
             logger.exception("Error fetching aircraft data")
@@ -853,6 +934,223 @@ class NearbyAircraftPlugin(PluginBase):
             if self._cache and self._cache.get("aircraft"):
                 return self._success_result(self._cache["aircraft"], self._cache["last_updated"])
             return PluginResult(available=False, error=str(e))
+
+    # ── Triggers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_unset(value: Any) -> bool:
+        return value is None or (isinstance(value, str) and not value.strip())
+
+    @staticmethod
+    def _split_list(value: Any) -> List[str]:
+        """Comma-separated setting -> upper-case, non-empty entries."""
+        if not isinstance(value, str):
+            return []
+        return [part.strip().upper() for part in value.split(",") if part.strip()]
+
+    def _number_setting(self, key: str, integer: bool) -> Optional[float]:
+        """A numeric rule setting, or None when it is unset or invalid."""
+        value = self.config.get(key)
+        if self._is_unset(value) or isinstance(value, bool):
+            return None
+        try:
+            number = int(value) if integer else float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number >= 0 else None
+
+    def _trigger_rules(self) -> Dict[str, Any]:
+        """The watch rules the user filled in (an empty dict when none)."""
+        rules: Dict[str, Any] = {}
+        call_signs = self._split_list(self.config.get("trigger_call_signs"))
+        if call_signs:
+            rules["call_signs"] = call_signs
+        types = self._split_list(self.config.get("trigger_aircraft_types"))
+        if types:
+            rules["aircraft_types"] = types
+        max_alt = self._number_setting("trigger_max_altitude_ft", integer=True)
+        if max_alt is not None:
+            rules["max_altitude_ft"] = max_alt
+        max_dist = self._number_setting("trigger_max_distance_km", integer=False)
+        if max_dist is not None:
+            rules["max_distance_km"] = max_dist
+        return rules
+
+    def _trigger_duration_seconds(self) -> int:
+        value = self.config.get("trigger_duration_seconds", DEFAULT_TRIGGER_DURATION_SECONDS)
+        if isinstance(value, bool) or not isinstance(value, int) or value < MIN_TRIGGER_DURATION_SECONDS:
+            return DEFAULT_TRIGGER_DURATION_SECONDS
+        return value
+
+    def _trigger_cooldown(self) -> timedelta:
+        value = self.config.get("trigger_cooldown_minutes", DEFAULT_TRIGGER_COOLDOWN_MINUTES)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            value = DEFAULT_TRIGGER_COOLDOWN_MINUTES
+        return timedelta(minutes=value)
+
+    @staticmethod
+    def _type_matches(aircraft_type: str, wanted: List[str]) -> bool:
+        """Prefix match on the readable type, or exact ICAO designator match."""
+        readable = (aircraft_type or "").strip().upper()
+        if not readable:
+            return False
+        for value in wanted:
+            if readable.startswith(value):
+                return True
+            name = AIRCRAFT_TYPE_NAMES.get(value)
+            if name is not None and name.upper() == readable:
+                return True
+        return False
+
+    def _match_trigger_rules(self, aircraft_list: List[Dict]) -> List[Dict]:
+        """Aircraft (from *aircraft_list*) that satisfy every filled-in rule.
+
+        Rules combine with AND; several values within one rule match any of
+        them. The aircraft type is only looked up for aircraft passing every
+        other rule, and at most MAX_TRIGGER_TYPE_LOOKUPS_PER_FETCH lookups
+        that are not already memoised are started per call.
+        """
+        rules = self._trigger_rules()
+        self._trigger_lookup_budget = MAX_TRIGGER_TYPE_LOOKUPS_PER_FETCH
+        if not rules:
+            return []
+
+        candidates = []
+        for aircraft in aircraft_list:
+            if not aircraft.get("icao24"):
+                continue
+            call_signs = rules.get("call_signs")
+            if call_signs:
+                call_sign = str(aircraft.get("call_sign") or "").strip().upper()
+                if not any(call_sign.startswith(prefix) for prefix in call_signs):
+                    continue
+            max_alt = rules.get("max_altitude_ft")
+            if max_alt is not None and aircraft.get("altitude", 0) > max_alt:
+                continue
+            max_dist = rules.get("max_distance_km")
+            if max_dist is not None and aircraft.get("distance_km", float("inf")) > max_dist:
+                continue
+            candidates.append(aircraft)
+
+        wanted_types = rules.get("aircraft_types")
+        if not wanted_types:
+            return candidates
+
+        matches = []
+        for aircraft in candidates:
+            aircraft_type = self._budgeted_type(aircraft["icao24"])
+            if aircraft_type is None:
+                continue  # budget spent; checked on a later fetch
+            if self._type_matches(aircraft_type, wanted_types):
+                matches.append(aircraft)
+        return matches
+
+    def _budgeted_type(self, icao24: str) -> Optional[str]:
+        """Memoised type, or a new lookup while the per-fetch budget lasts (else None)."""
+        key = (icao24 or "").strip().upper()
+        if key and key not in self.__dict__.setdefault("_type_cache", {}):
+            if self._trigger_lookup_budget <= 0:
+                return None
+            self._trigger_lookup_budget -= 1
+        return self._lookup_aircraft_type(icao24)
+
+    def _budgeted_route(self, call_sign: str) -> Dict[str, str]:
+        """Memoised route, or a new lookup while the per-fetch budget lasts (else empty)."""
+        key = (call_sign or "").strip().upper()
+        if key and key not in self.__dict__.setdefault("_route_cache", {}):
+            if self._trigger_lookup_budget <= 0:
+                return {"origin": "", "destination": "", "flight_number": ""}
+            self._trigger_lookup_budget -= 1
+        return self._lookup_route(call_sign)
+
+    @staticmethod
+    def _trigger_message(aircraft: Dict[str, Any]) -> str:
+        """Plain message shown when no trigger page is chosen."""
+        lines = [f"{aircraft.get('call_sign', '')} {aircraft.get('aircraft_type', '')}".strip()]
+        origin, destination = aircraft.get("origin", ""), aircraft.get("destination", "")
+        if origin and destination:
+            lines.append(f"{origin}>{destination}")
+        lines.append(f"{aircraft.get('altitude', 0)}FT {aircraft.get('distance_km', 0)}KM")
+        return "\n".join(lines)
+
+    def _build_trigger(self, aircraft: Dict[str, Any], display_data: Dict[str, Any]) -> TriggerResult:
+        """TriggerResult for *aircraft*: the normal data, closest fields overridden."""
+        enriched = dict(aircraft)
+        enriched.update(self._budgeted_route(enriched.get("call_sign", "")))
+        enriched["aircraft_type"] = self._budgeted_type(enriched["icao24"]) or ""
+
+        data = copy.deepcopy(display_data) if display_data else {}
+        for key in ("call_sign", "flight_number", "aircraft_type", "origin",
+                    "destination", "altitude", "ground_speed", "squawk", "distance_km"):
+            data[key] = enriched.get(key, "")
+
+        return TriggerResult(
+            triggered=True,
+            trigger_id=f"{TRIGGER_ID_PREFIX}{enriched['icao24']}",
+            message=self._trigger_message(enriched),
+            priority=TRIGGER_PRIORITY,
+            duration_seconds=self._trigger_duration_seconds(),
+            data=data,
+        )
+
+    def _update_trigger_state(self, in_radius: List[Dict], matches: List[Dict],
+                              display_data: Dict[str, Any]) -> None:
+        """Fold one fresh fetch into the trigger state.
+
+        Only called after a fresh OpenSky response; the cache, 429 and error
+        paths leave the trigger state untouched.
+        """
+        if not self._trigger_rules():
+            return
+        now = _utcnow()
+        cooldown = self._trigger_cooldown()
+        self._trigger_fired_at = {
+            icao: fired for icao, fired in self._trigger_fired_at.items() if now - fired < cooldown
+        }
+
+        # Active/pending aircraft that no longer match (moved out of range,
+        # climbed, left the radius or landed) lose their trigger now.
+        matching = {str(a["icao24"]) for a in matches}
+        for icao in sorted(self._trigger_active - matching):
+            self._trigger_active.discard(icao)
+            self._trigger_dismissals.append(f"{TRIGGER_ID_PREFIX}{icao}")
+        for icao in list(self._trigger_pending):
+            if icao not in matching:
+                del self._trigger_pending[icao]
+                self._trigger_fired_at.pop(icao, None)  # never shown: no cooldown
+
+        for aircraft in matches:
+            icao = str(aircraft["icao24"])
+            if icao in self._trigger_fired_at or icao in self._trigger_pending:
+                continue
+            self._trigger_pending[icao] = self._build_trigger(aircraft, display_data)
+            self._trigger_fired_at[icao] = now
+
+    def check_triggers(self) -> List[TriggerResult]:
+        """Return one trigger per newly matching aircraft, once per cooldown.
+
+        Reads only the state left by the latest fresh fetch_data(); never
+        calls OpenSky itself. Aircraft that no longer match since their
+        trigger fired have that trigger dismissed early.
+        """
+        if self._trigger_dismissals:
+            dismissals, self._trigger_dismissals = self._trigger_dismissals, []
+            try:
+                from src.triggers.service import get_trigger_service
+                service = get_trigger_service()
+                for trigger_id in dismissals:
+                    service.dismiss_trigger(trigger_id)  # False = already expired; fine
+            except Exception:
+                logger.exception("Could not dismiss nearby aircraft triggers")
+
+        if not self._trigger_rules():
+            self._trigger_pending.clear()
+            return []
+
+        results = list(self._trigger_pending.values())
+        self._trigger_active.update(self._trigger_pending)
+        self._trigger_pending.clear()
+        return results
 
     def get_formatted_display(self) -> Optional[List[str]]:
         """Return the plugin's own whole-board display, sized to the board.
