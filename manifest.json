@@ -1,7 +1,7 @@
 {
   "id": "nearby_aircraft",
   "name": "Nearby Aircraft",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Display real-time nearby aircraft information from OpenSky Network API",
   "author": "FiestaBoard Team",
   "repository": "https://github.com/Fiestaboard/fiestaboard-plugin--nearby-aircraft",
@@ -48,6 +48,12 @@
         "type": "string",
         "title": "OpenSky Client Secret (Optional)",
         "description": "Client secret for authenticated API access",
+        "ui:widget": "password"
+      },
+      "airlabs_api_key": {
+        "type": "string",
+        "title": "AirLabs API Key (Optional)",
+        "description": "Looks up the real flight number on airlabs.co, also for alphanumeric call signs like BEL5EN. Without a key the flight number is derived from the call sign, which is empty or wrong for some flights.",
         "ui:widget": "password"
       },
       "max_aircraft": {
@@ -236,7 +242,7 @@
         "example": "LAX"
       },
       "flight_number": {
-        "description": "Flight number (IATA) of closest aircraft; empty when its call sign is alphanumeric",
+        "description": "Flight number (IATA) of closest aircraft; from AirLabs when a key is set, else derived from a numeric call sign (empty for alphanumeric ones)",
         "type": "string",
         "max_length": 7,
         "group": "closest",

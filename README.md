@@ -262,11 +262,32 @@ The `headers` variable uses the same column widths as the aircraft data, ensurin
 - `radius_km`: Search radius (default: 50)
 - `client_id`: OAuth2 client ID
 - `client_secret`: OAuth2 client secret
+- `airlabs_api_key`: AirLabs API key for real flight numbers (see [Flight numbers](#flight-numbers))
 - `max_aircraft`: Maximum to display (default: 4, max: 24; the board actually rendered on may show fewer)
 - `refresh_seconds`: Update interval (default: 120, min: 10)
 - `trigger_call_signs`, `trigger_aircraft_types`, `trigger_max_altitude_ft`, `trigger_max_distance_km`: watch rules (all empty by default, see [Trigger a page](#trigger-a-page))
 - `trigger_duration_seconds`: How long a trigger stays on the board (default: 60, min: 10)
 - `trigger_cooldown_minutes`: Minimum time before the same aircraft fires again (default: 30, min: 0)
+
+### Flight numbers
+
+Without an AirLabs key, `flight_number` is derived from the call sign and the
+airline adsbdb returns (`BAW123` -> `BA123`). That is empty for alphanumeric
+ATC call signs (`BEL5EN`) and wrong when the call sign number differs from the
+published flight number.
+
+With `airlabs_api_key` set, the plugin asks AirLabs live flights
+(`/api/v9/flights?hex=<icao24>`) for the aircraft's `flight_iata` and uses it
+instead. Notes:
+
+- Looked up only for the aircraft shown on the board (and for triggers, inside
+  the same 10-lookups-per-fetch budget). Each result, including a miss, is
+  remembered per icao24 + call sign, so one flight costs one request.
+- A miss falls back to the derived number.
+- After an AirLabs error (bad key, quota used up, outage) the plugin skips
+  AirLabs for 15 minutes. Changing the settings ends that pause.
+- Check your AirLabs plan returns `flight_iata`: the docs mark only some
+  fields as available on the free plan.
 
 ### Validation
 
@@ -360,7 +381,7 @@ aircraft passes. This is opt-in: with every rule empty, it never fires a trigger
   `max_aircraft` closest ones shown on the board.
 - The aircraft type is looked up (adsbdb) only for aircraft that pass every
   other rule; an aircraft whose type is unknown never matches a type rule.
-- At most 10 new adsbdb lookups (type and route together) are started per
+- At most 10 new adsbdb/AirLabs lookups (type, route, flight number together) are started per
   fetch for triggers. Past that, a trigger still fires but shows only values
   already known (e.g. an empty `origin`/`aircraft_type`); aircraft whose type
   could not be checked yet are checked on a later fetch.

@@ -99,6 +99,7 @@ For higher rate limits and better reliability:
 | radius_km | number | 50 | Search radius in kilometers |
 | client_id | string | - | OpenSky OAuth2 client ID (optional) |
 | client_secret | string | - | OpenSky OAuth2 client secret (optional) |
+| airlabs_api_key | string | - | AirLabs API key; looks up the real flight number (optional) |
 | max_aircraft | integer | 4 | Maximum aircraft to display (1-24; actual count shown is also limited by the board size) |
 | refresh_seconds | integer | 120 | Update interval (minimum 10 seconds) |
 

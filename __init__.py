@@ -48,6 +48,12 @@ OPENSKY_STATES_URL = f"{OPENSKY_BASE_URL}/states/all"
 ROUTE_LOOKUP_URL = "https://api.adsbdb.com/v0/callsign"
 # Free, keyless icao24 -> aircraft type lookup.
 AIRCRAFT_LOOKUP_URL = "https://api.adsbdb.com/v0/aircraft"
+# Optional live flight lookup (needs an AirLabs API key) for the real IATA
+# flight number, which the call sign alone does not always give.
+AIRLABS_FLIGHTS_URL = "https://airlabs.co/api/v9/flights"
+# After an AirLabs error (bad key, quota spent, outage) skip it for this long
+# instead of spending a request on every refresh.
+AIRLABS_BACKOFF = timedelta(minutes=15)
 
 # Readable names for common ICAO aircraft type designators (at most 11
 # characters, the manifest's max_length for aircraft_type). Designators not
@@ -100,6 +106,8 @@ DEFAULT_TRIGGER_COOLDOWN_MINUTES = 30
 # Lookups are memoised, so a skipped aircraft is checked on a later fetch.
 MAX_TRIGGER_TYPE_LOOKUPS_PER_FETCH = 10
 TRIGGER_ID_PREFIX = "aircraft_"
+# Manifest max_length for flight_number.
+MAX_FLIGHT_NUMBER_LENGTH = 7
 
 
 def _utcnow() -> datetime:
@@ -233,11 +241,15 @@ class NearbyAircraftPlugin(PluginBase):
         The cache is keyed only on age, so without this a change to
         `latitude`/`longitude`/`radius_km` would keep serving aircraft found
         around the old position for up to refresh_seconds. The access token
-        is minted from `client_id`/`client_secret`, so it goes too.
+        is minted from `client_id`/`client_secret`, so it goes too, and so
+        does an AirLabs backoff (the key may just have been fixed).
         """
         self._cache = None
         self._access_token = None
         self._token_expires_at = None
+        self._airlabs_backoff_until = None
+        if (old_config or {}).get("airlabs_api_key") != (new_config or {}).get("airlabs_api_key"):
+            self._airlabs_cache = {}
         self._reset_trigger_state()
         logger.debug("Cleared cached aircraft after config change")
     
@@ -492,6 +504,72 @@ class NearbyAircraftPlugin(PluginBase):
         if not suffix.isdigit():
             return ""
         return f"{iata}{int(suffix)}"
+
+    def _airlabs_key(self) -> str:
+        value = self.config.get("airlabs_api_key")
+        return value.strip() if isinstance(value, str) else ""
+
+    def _airlabs_cache_key(self, icao24: str, call_sign: str) -> Optional[Tuple[str, str]]:
+        """Memo key for an AirLabs lookup, or None when AirLabs is not used."""
+        icao = (icao24 or "").strip().upper()
+        if not self._airlabs_key() or not icao:
+            return None
+        return icao, (call_sign or "").strip().upper()
+
+    def _lookup_airlabs_flight_number(self, icao24: str, call_sign: str) -> str:
+        """Best-effort real IATA flight number (e.g. SN2903) from AirLabs live flights.
+
+        Looks the aircraft up by its icao24 address, so alphanumeric ATC call
+        signs (BEL5EN) still resolve to the published flight number. Memoised
+        per (icao24, call sign), so a new leg with a new call sign is looked
+        up again. Returns "" without an API key, on a miss or on an error;
+        errors back off for AIRLABS_BACKOFF. Never raises.
+        """
+        key = self._airlabs_cache_key(icao24, call_sign)
+        if key is None:
+            return ""
+        cache = self.__dict__.setdefault("_airlabs_cache", {})
+        if key in cache:
+            return cache[key]
+        backoff_until = self.__dict__.get("_airlabs_backoff_until")
+        if backoff_until and _utcnow() < backoff_until:
+            return ""
+        try:
+            resp = requests.get(
+                AIRLABS_FLIGHTS_URL,
+                params={
+                    "api_key": self._airlabs_key(),
+                    "hex": key[0],
+                    "_fields": "hex,flight_icao,flight_iata",
+                },
+                timeout=5,
+            )
+            body = resp.json() if resp.status_code == 200 else None
+            if not isinstance(body, (dict, list)) or (isinstance(body, dict) and body.get("error")):
+                error = body.get("error") if isinstance(body, dict) else resp.status_code
+                logger.warning(f"AirLabs lookup failed ({error}); retrying in {AIRLABS_BACKOFF}")
+                self._airlabs_backoff_until = _utcnow() + AIRLABS_BACKOFF
+                return ""
+            flights = body.get("response") if isinstance(body, dict) else body
+            flight = next(
+                (f for f in flights or [] if isinstance(f, dict)
+                 and str(f.get("hex") or "").upper() == key[0]),
+                {},
+            )
+            flight_number = str(flight.get("flight_iata") or "").strip().upper()
+            if len(flight_number) > MAX_FLIGHT_NUMBER_LENGTH:
+                flight_number = ""
+            cache[key] = flight_number
+            return flight_number
+        except Exception as e:
+            logger.debug(f"AirLabs lookup failed for {key[0]}: {e}")
+            return ""
+
+    def _lookup_flight(self, icao24: str, call_sign: str) -> Dict[str, str]:
+        """Route for *call_sign*, with AirLabs' flight number when it has one."""
+        route = self._lookup_route(call_sign)
+        flight_number = self._lookup_airlabs_flight_number(icao24, call_sign)
+        return {**route, "flight_number": flight_number} if flight_number else route
 
     def _lookup_aircraft_type(self, icao24: str) -> str:
         """Best-effort readable aircraft type (e.g. 737-800) for an icao24 address.
@@ -912,7 +990,7 @@ class NearbyAircraftPlugin(PluginBase):
                 return result
 
             for aircraft in nearby_aircraft:
-                aircraft.update(self._lookup_route(aircraft["call_sign"]))
+                aircraft.update(self._lookup_flight(aircraft["icao24"], aircraft["call_sign"]))
                 aircraft["aircraft_type"] = self._lookup_aircraft_type(aircraft["icao24"])
 
             last_updated = datetime.now(timezone.utc).isoformat()
@@ -1063,6 +1141,17 @@ class NearbyAircraftPlugin(PluginBase):
             self._trigger_lookup_budget -= 1
         return self._lookup_route(call_sign)
 
+    def _budgeted_flight(self, icao24: str, call_sign: str) -> Dict[str, str]:
+        """_budgeted_route, plus AirLabs' flight number while the per-fetch budget lasts."""
+        route = self._budgeted_route(call_sign)
+        key = self._airlabs_cache_key(icao24, call_sign)
+        if key is not None and key not in self.__dict__.setdefault("_airlabs_cache", {}):
+            if self._trigger_lookup_budget <= 0:
+                return route
+            self._trigger_lookup_budget -= 1
+        flight_number = self._lookup_airlabs_flight_number(icao24, call_sign)
+        return {**route, "flight_number": flight_number} if flight_number else route
+
     @staticmethod
     def _trigger_message(aircraft: Dict[str, Any]) -> str:
         """Plain message shown when no trigger page is chosen."""
@@ -1076,7 +1165,7 @@ class NearbyAircraftPlugin(PluginBase):
     def _build_trigger(self, aircraft: Dict[str, Any], display_data: Dict[str, Any]) -> TriggerResult:
         """TriggerResult for *aircraft*: the normal data, closest fields overridden."""
         enriched = dict(aircraft)
-        enriched.update(self._budgeted_route(enriched.get("call_sign", "")))
+        enriched.update(self._budgeted_flight(enriched["icao24"], enriched.get("call_sign", "")))
         enriched["aircraft_type"] = self._budgeted_type(enriched["icao24"]) or ""
 
         data = copy.deepcopy(display_data) if display_data else {}
