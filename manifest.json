@@ -1,7 +1,7 @@
 {
   "id": "nearby_aircraft",
   "name": "Nearby Aircraft",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Display real-time nearby aircraft information from OpenSky Network API",
   "author": "FiestaBoard Team",
   "repository": "https://github.com/Fiestaboard/fiestaboard-plugin--nearby-aircraft",
@@ -53,7 +53,7 @@
       "airlabs_api_key": {
         "type": "string",
         "title": "AirLabs API Key (Optional)",
-        "description": "Looks up the real flight number on airlabs.co, also for alphanumeric call signs like BEL5EN. Without a key the flight number is derived from the call sign, which is empty or wrong for some flights.",
+        "description": "Backup source on airlabs.co: when adsbdb has no flight number (e.g. alphanumeric call signs like BEL5EN) or no aircraft type, AirLabs fills the missing value. adsbdb values are never replaced. Without a key only adsbdb is used.",
         "ui:widget": "password"
       },
       "max_aircraft": {
@@ -80,7 +80,7 @@
       "trigger_aircraft_types": {
         "type": "string",
         "title": "Trigger: Aircraft Types (Optional)",
-        "description": "Comma-separated aircraft types, e.g. \"A380, 747\" (\"747\" matches \"747-8\") or ICAO designators like \"A388\". Case-insensitive.",
+        "description": "Comma-separated aircraft types, e.g. \"A380, 747\" (\"747\" matches \"747-8\") or ICAO designators like \"A388\". Case-insensitive. Matches the adsbdb type only, not a type filled in by AirLabs.",
         "default": ""
       },
       "trigger_max_altitude_ft": {
@@ -242,14 +242,14 @@
         "example": "LAX"
       },
       "flight_number": {
-        "description": "Flight number (IATA) of closest aircraft; from AirLabs when a key is set, else derived from a numeric call sign (empty for alphanumeric ones)",
+        "description": "Flight number (IATA) of closest aircraft; derived from a numeric call sign via adsbdb, else from AirLabs when a key is set (empty when neither has it)",
         "type": "string",
         "max_length": 7,
         "group": "closest",
         "example": "UA1234"
       },
       "aircraft_type": {
-        "description": "Aircraft type of closest aircraft (e.g. 737-800; uncommon types show the ICAO code)",
+        "description": "Aircraft type of closest aircraft (e.g. 737-800; uncommon types show the ICAO code); from adsbdb, else from AirLabs when a key is set",
         "type": "string",
         "max_length": 11,
         "group": "closest",

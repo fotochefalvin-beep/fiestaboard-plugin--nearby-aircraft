@@ -470,7 +470,7 @@ class TestManifest:
         assert props["trigger_duration_seconds"]["minimum"] == 10
         assert props["trigger_cooldown_minutes"]["default"] == 30
         assert props["trigger_cooldown_minutes"]["minimum"] == 0
-        assert sample_manifest["version"] == "1.4.0"
+        assert sample_manifest["version"] == "1.5.0"
 
     def test_host_injects_trigger_page_id(self, sample_manifest):
         from src.plugins.manifest import PluginManifest, validate_manifest
